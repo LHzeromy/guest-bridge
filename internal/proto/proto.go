@@ -93,14 +93,15 @@ type ExecReq struct {
 }
 
 type ExecResp struct {
-	Command  string `json:"command"`
-	Cwd      string `json:"cwd"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
-	ReadOnly bool   `json:"read_only"`
-	Approved bool   `json:"approved"`
-	TimedOut bool   `json:"timed_out,omitempty"`
+	Command    string `json:"command"`
+	Cwd        string `json:"cwd"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	ExitCode   int    `json:"exit_code"`
+	ReadOnly   bool   `json:"read_only"`
+	Approved   bool   `json:"approved"`
+	TimedOut   bool   `json:"timed_out,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
 }
 
 type EditFileReq struct {
@@ -137,10 +138,12 @@ type PullInitReq struct {
 }
 
 type PullInitResp struct {
-	PullID   string `json:"pull_id,omitempty"`
-	Path     string `json:"path"`
-	Size     int64  `json:"size"`
-	Approved bool   `json:"approved"`
+	PullID    string `json:"pull_id,omitempty"`
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	Approved  bool   `json:"approved"`
+	IsArchive bool   `json:"is_archive,omitempty"`
+	FileCount int    `json:"file_count,omitempty"`
 }
 
 type PullChunkReq struct {
@@ -154,4 +157,44 @@ type PullChunkResp struct {
 	BytesRead  int    `json:"bytes_read"`
 	EOF        bool   `json:"eof"`
 	SHA256     string `json:"sha256,omitempty"`
+}
+
+type PushManifestItem struct {
+	RelPath string `json:"rel_path"`
+	Size    int64  `json:"size"`
+	Mode    uint32 `json:"mode,omitempty"`
+}
+
+type PushInitReq struct {
+	RemotePath   string             `json:"remote_path"`
+	IsArchive    bool               `json:"is_archive,omitempty"`
+	FileName     string             `json:"file_name,omitempty"`
+	TransferSize int64              `json:"transfer_size"`
+	TotalRawSize int64              `json:"total_raw_size,omitempty"`
+	SHA256       string             `json:"sha256"`
+	Mode         uint32             `json:"mode,omitempty"`
+	Files        []PushManifestItem `json:"files,omitempty"`
+}
+
+type PushInitResp struct {
+	PushID     string `json:"push_id,omitempty"`
+	RemotePath string `json:"remote_path"`
+	Approved   bool   `json:"approved"`
+	Overwrite  int    `json:"overwrite,omitempty"`
+	Create     int    `json:"create,omitempty"`
+}
+
+type PushChunkReq struct {
+	PushID     string `json:"push_id"`
+	Offset     int64  `json:"offset"`
+	DataBase64 string `json:"data_base64,omitempty"`
+	EOF        bool   `json:"eof,omitempty"`
+}
+
+type PushChunkResp struct {
+	ReceivedBytes int64    `json:"received_bytes"`
+	Committed     bool     `json:"committed,omitempty"`
+	SHA256        string   `json:"sha256,omitempty"`
+	FilesWritten  int      `json:"files_written,omitempty"`
+	WrittenPaths  []string `json:"written_paths,omitempty"`
 }

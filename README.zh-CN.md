@@ -13,10 +13,14 @@
 - **零第三方依赖**：100% 使用 Go 标准库编写（`go.mod` 无任何外部模块），代码精简、透明，几分钟即可完整审计。
 - **联网前强制本地授权菜单**：`guest-agent` 启动后必须检测交互式控制台，**在建立中继隧道之前**先由目标机所有者亲手选择本次权限：
   - **`[1]` 纯只读诊断**：仅允许查看文件、列目录、搜索与系统概览；彻底禁用一切文件写入与通用命令执行。
-  - **`[2]` 自由只读排查 + 逐次审批写入**：系统可信路径下的只读查询自动运行并实时打印透明日志；读取敏感凭证路径（`~/.ssh`、`.env`、`*.key`/`*.pem`、`/etc/shadow`、`/proc/*/environ`）、所有文件修改（先展示红绿彩色 Diff）、修改类/复合命令及截屏均强制弹 `[y/N]` 确认；拒绝修改时不回传任何文件内容或 Diff。
-  - **`[3]` 仅限当前目录模式**：将文件操作严格锁定在启动时的当前目录内（含规范路径与符号链接逃逸检查），彻底禁用通用 Shell 命令，写入同样需 `[y/N]` 确认。
+  - **`[2]` 自由只读排查 + 逐次审批写入**：系统可信路径下的只读查询自动运行并实时打印透明日志；读取敏感凭证路径（`~/.ssh`、`.env`、`*.key`/`*.pem`、`/etc/shadow`、`/proc/*/environ`）、所有文件修改（先展示红绿彩色 Diff）、修改类/复合命令（批准后实时回显输出与退出码）、文件推送/回传及截屏均强制弹 `[y/N]` 确认；拒绝修改时不回传任何文件内容或 Diff。
+  - **`[3]` 仅限当前目录模式**：将文件操作严格锁定在启动时的当前目录内（含规范路径与符号链接逃逸检查），彻底禁用通用 Shell 命令，写入/推送/回传同样需 `[y/N]` 确认。
   - **`[q]` 取消退出**：不建立任何网络连接，立即退出。
-- **退出屏幕操作摘要**：按 `Ctrl+C` 或由主控端执行 `guestctl close` 后，立即断开通道、尽力清理临时二进制，并在目标机屏幕打印本次会话摘要（读过的文件、只读查询次数、批准的命令/修改/截屏、已拒绝次数），**不在目标机写日志文件**。
+- **脚本实时回显 + 批量/大文件双向传输（`v0.2.0`）**：
+  - 被控端批准执行命令或脚本后，实时清洗并回显 `stdout/stderr`（带行数上限防刷屏），结束时打印退出码与耗时；只读查询也会显示耗时与结果摘要。
+  - 新增 `guestctl push`，支持二进制大文件、多文件或整目录打包（自动排除 `.git`/`__pycache__`/`node_modules`/`.venv`，最高 200MB），被控端展示完整文件清单后**仅需按一次 `y`** 即流式加密落地并校验 SHA-256（拒绝符号链接/路径穿越/清单篡改）。
+  - `guestctl pull` 同样支持单文件或整目录打包（`.tar.gz`）加密回传（最高 200MB），可选 `--extract` 安全解压。
+- **退出屏幕操作摘要**：按 `Ctrl+C` 或由主控端执行 `guestctl close` 后，立即断开通道、尽力清理临时二进制，并在目标机屏幕打印本次会话摘要（读过的文件、只读查询次数、批准的命令/修改/回传/推送/截屏、已拒绝次数），**不在目标机写日志文件**。
 - **端到端加密盲转发**：隧道使用 TLS 1.3 证书指纹固定 + 双向 HMAC 认证握手 + AES-256-GCM 递增序号帧加密；中继不接收 256 位端到端密钥（PSK），不落盘任何会话日志。
 - **公开 Release 透明分发 + 独立校验**：支持优先从 GitHub Releases 官方构建直连拉取（可选国内/私有中继镜像兜底），并在执行前对照主控端本地固化的 `SHA-256` 校验。
 - **归档仅留存主控端本地**：会话元数据（`meta.json`）、审计日志（`session.jsonl`）、修改前备份与 Diff（`diffs/`）、桌面截图（`screenshots/`）仅保存在主控机 `~/.local/share/guestctl/sessions/`。*（注：连接建立后，目标机将上报用户名、主机名、系统版本与启动目录供排查使用。）*
@@ -111,7 +115,7 @@ cat > ~/.config/guestctl/config.json << 'EOF'
   "relay_addr": "YOUR_RELAY_IP_OR_DOMAIN:34434",
   "admin_sock": "/run/guest-relay/admin.sock",
   "admin_user": "guest-relay",
-  "release_url": "https://github.com/LHzeromy/guest-bridge/releases/download/v0.1.2"
+  "release_url": "https://github.com/LHzeromy/guest-bridge/releases/download/v0.2.0"
 }
 EOF
 chmod 600 ~/.config/guestctl/config.json
@@ -138,7 +142,9 @@ guestctl read --start 1 --end 120 /path/to/file
 guestctl grep "ERROR" /path/to/logs
 guestctl exec "nvidia-smi"
 guestctl edit --old "batch_size = 64" --new "batch_size = 16" /path/to/train.py
-guestctl pull --out ./collected/ /path/to/deploy_metrics.npz   # 目标机 [y/N] 同意后分块回传（≤100MB）
+guestctl push ./policy/ /path/on/remote/policy/                # 单次 [y/N] 推送大文件/多文件/整目录（≤200MB）
+guestctl pull --out ./collected/ /path/to/deploy_metrics.npz   # 目标机 [y/N] 同意后加密回传文件或目录（≤200MB）
+guestctl pull --out ./logs_dir --extract /path/to/remote_logs  # 整目录打包回传并安全解压
 guestctl screenshot
 
 # 4. 结束会话（目标机按 Ctrl+C 或主控端执行 close 均可随时断开）

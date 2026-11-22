@@ -46,8 +46,8 @@ const (
 	ansiDim    = "\033[2m"
 
 	maxEditFileBytes = 2 * 1024 * 1024   // 2 MiB max target file size for edit/write preview
-	maxPullFileBytes = 100 * 1024 * 1024 // 100 MiB max file size for chunked pull transfer
-	maxPullChunkSize = 256 * 1024        // 256 KiB raw chunk per E2EE frame
+	maxPullFileBytes = maxTransferFileBytes
+	maxPullChunkSize = maxTransferChunkSize
 )
 
 // Populated automatically by CI/Release builds via -ldflags.
@@ -62,9 +62,10 @@ type sessionStats struct {
 	readFiles     []string
 	readSeen      map[string]bool
 	roQueries     int
-	approvedEdits []string
-	approvedPulls []string
-	approvedExecs int
+	approvedEdits  []string
+	approvedPulls  []string
+	approvedPushes []string
+	approvedExecs  int
 	screenshots   int
 	rejectedOps   int
 }
@@ -100,6 +101,12 @@ func (s *sessionStats) addEdit(p string) {
 func (s *sessionStats) addPull(p string) {
 	s.mu.Lock()
 	s.approvedPulls = append(s.approvedPulls, p)
+	s.mu.Unlock()
+}
+
+func (s *sessionStats) addPush(p string) {
+	s.mu.Lock()
+	s.approvedPushes = append(s.approvedPushes, p)
 	s.mu.Unlock()
 }
 
@@ -156,13 +163,22 @@ func (s *sessionStats) printReceipt(w io.Writer, cleaned bool) {
 		fmt.Fprintf(w, "（%s）", strings.Join(safeEdits, ", "))
 	}
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "  批准回传: %d 个", len(s.approvedPulls))
+	fmt.Fprintf(w, "  批准回传: %d 次", len(s.approvedPulls))
 	if len(s.approvedPulls) > 0 {
 		var safePulls []string
 		for _, pf := range s.approvedPulls {
 			safePulls = append(safePulls, sanitizeSingleLine(pf))
 		}
 		fmt.Fprintf(w, "（%s）", strings.Join(safePulls, ", "))
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  批准推送: %d 次", len(s.approvedPushes))
+	if len(s.approvedPushes) > 0 {
+		var safePushes []string
+		for _, pf := range s.approvedPushes {
+			safePushes = append(safePushes, sanitizeSingleLine(pf))
+		}
+		fmt.Fprintf(w, "（%s）", strings.Join(safePushes, ", "))
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "  批准截屏: %d 次\n", s.screenshots)
@@ -176,12 +192,14 @@ func (s *sessionStats) printReceipt(w io.Writer, cleaned bool) {
 }
 
 type activePull struct {
-	id     string
-	path   string
-	file   *os.File
-	size   int64
-	offset int64
-	hasher hash.Hash
+	id            string
+	path          string
+	file          *os.File
+	tmpPath       string
+	removeOnClose bool
+	size          int64
+	offset        int64
+	hasher        hash.Hash
 }
 
 type agent struct {
@@ -191,6 +209,8 @@ type agent struct {
 	promptMu   sync.Mutex
 	pullMu     sync.Mutex
 	curPull    *activePull
+	pushMu     sync.Mutex
+	curPush    *activePush
 	ttyLines   <-chan string
 	ttyOutFile *os.File
 	hasTTY     bool
@@ -219,6 +239,7 @@ func (a *agent) stop() {
 	a.stopOnce.Do(func() {
 		a.cancel()
 		a.closeActivePull()
+		a.closeActivePush()
 	})
 }
 
@@ -227,6 +248,9 @@ func (a *agent) closeActivePull() {
 	defer a.pullMu.Unlock()
 	if a.curPull != nil {
 		_ = a.curPull.file.Close()
+		if a.curPull.removeOnClose && a.curPull.tmpPath != "" {
+			_ = os.Remove(a.curPull.tmpPath)
+		}
 		a.curPull = nil
 	}
 }
@@ -470,6 +494,10 @@ func (a *agent) serveLoop() error {
 			a.handlePullInit(msg)
 		case "pull_chunk":
 			a.handlePullChunk(msg)
+		case "push_init":
+			a.handlePushInit(msg)
+		case "push_chunk":
+			a.handlePushChunk(msg)
 		default:
 			_ = a.sendResp(msg.ID, msg.Action, false, "unknown action: "+msg.Action, nil)
 		}
@@ -859,10 +887,32 @@ func (a *agent) handleExec(msg proto.Message) {
 	var outBuf, errBuf limitedBuffer
 	outBuf.limit = 512 * 1024
 	errBuf.limit = 512 * 1024
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
+
+	var liveOut, liveErr *liveExecStream
+	startAt := time.Now()
+	if !ro {
+		ts := startAt.Format("15:04:05")
+		fmt.Fprintf(os.Stderr, "%s[%s]%s %s▶ 开始执行%s (超时 %ds): %s\n",
+			ansiDim, ts, ansiReset, ansiCyan+ansiBold, ansiReset, int(timeout/time.Second), sanitizeSingleLine(req.Command))
+		live := newLiveExecConsole(os.Stderr)
+		liveOut = live.NewStream(false)
+		liveErr = live.NewStream(true)
+		cmd.Stdout = io.MultiWriter(&outBuf, liveOut)
+		cmd.Stderr = io.MultiWriter(&errBuf, liveErr)
+	} else {
+		cmd.Stdout = &outBuf
+		cmd.Stderr = &errBuf
+	}
 
 	err := cmd.Run()
+	if liveOut != nil {
+		liveOut.Flush()
+	}
+	if liveErr != nil {
+		liveErr.Flush()
+	}
+	elapsed := time.Since(startAt)
+
 	exitCode := 0
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	if err != nil {
@@ -876,15 +926,52 @@ func (a *agent) handleExec(msg proto.Message) {
 			}
 		}
 	}
+
+	endTS := time.Now().Format("15:04:05")
+	durStr := elapsed.Round(10 * time.Millisecond).String()
+	if elapsed < time.Second {
+		durStr = elapsed.Round(time.Millisecond).String()
+	}
+	if !ro {
+		switch {
+		case timedOut:
+			fmt.Fprintf(os.Stderr, "%s[%s]%s %s⏱ 执行超时%s (exit=%d, 耗时 %s, stdout %s, stderr %s)\n",
+				ansiDim, endTS, ansiReset, ansiYellow+ansiBold, ansiReset, exitCode, durStr,
+				formatBytesHuman(int64(outBuf.buf.Len())), formatBytesHuman(int64(errBuf.buf.Len())))
+		case exitCode == 0:
+			fmt.Fprintf(os.Stderr, "%s[%s]%s %s✓ 执行完成%s (exit=0, 耗时 %s, stdout %s, stderr %s)\n",
+				ansiDim, endTS, ansiReset, ansiGreen+ansiBold, ansiReset, durStr,
+				formatBytesHuman(int64(outBuf.buf.Len())), formatBytesHuman(int64(errBuf.buf.Len())))
+		default:
+			fmt.Fprintf(os.Stderr, "%s[%s]%s %s✗ 执行结束%s (exit=%d, 耗时 %s, stdout %s, stderr %s)\n",
+				ansiDim, endTS, ansiReset, ansiRed+ansiBold, ansiReset, exitCode, durStr,
+				formatBytesHuman(int64(outBuf.buf.Len())), formatBytesHuman(int64(errBuf.buf.Len())))
+		}
+	} else {
+		if exitCode == 0 && !timedOut {
+			fmt.Fprintf(os.Stderr, "%s[%s]%s %s[只读]%s %s✓ 完成%s (耗时 %s, 输出 %s)\n",
+				ansiDim, endTS, ansiReset, ansiCyan, ansiReset, ansiGreen, ansiReset, durStr,
+				formatBytesHuman(int64(outBuf.buf.Len())))
+		} else {
+			errHint := strings.TrimSpace(errBuf.buf.String())
+			if clipped, trunc := truncateUTF8Bytes(errHint, 120); trunc {
+				errHint = clipped + "…"
+			}
+			fmt.Fprintf(os.Stderr, "%s[%s]%s %s[只读]%s %s✗ 结束%s (exit=%d, 耗时 %s, %s)\n",
+				ansiDim, endTS, ansiReset, ansiCyan, ansiReset, ansiYellow, ansiReset, exitCode, durStr, sanitizeSingleLine(errHint))
+		}
+	}
+
 	_ = a.sendResp(msg.ID, msg.Action, true, "", proto.ExecResp{
-		Command:  req.Command,
-		Cwd:      cwd,
-		Stdout:   outBuf.buf.String(),
-		Stderr:   errBuf.buf.String(),
-		ExitCode: exitCode,
-		ReadOnly: ro,
-		Approved: true,
-		TimedOut: timedOut,
+		Command:    req.Command,
+		Cwd:        cwd,
+		Stdout:     outBuf.buf.String(),
+		Stderr:     errBuf.buf.String(),
+		ExitCode:   exitCode,
+		ReadOnly:   ro,
+		Approved:   true,
+		TimedOut:   timedOut,
+		DurationMs: elapsed.Milliseconds(),
 	})
 }
 
@@ -1212,8 +1299,8 @@ func (a *agent) handlePullInit(msg proto.Message) {
 		_ = a.sendResp(msg.ID, msg.Action, true, "", proto.PullInitResp{Path: rawPath, Approved: false})
 		return
 	}
-	if lfi0, err := os.Lstat(rawPath); err == nil && (lfi0.Mode()&os.ModeSymlink != 0 || !lfi0.Mode().IsRegular()) {
-		_ = a.sendResp(msg.ID, msg.Action, false, "refused: target is a symlink or non-regular file", nil)
+	if lfi0, err := os.Lstat(rawPath); err == nil && (lfi0.Mode()&os.ModeSymlink != 0 || (!lfi0.Mode().IsRegular() && !lfi0.IsDir())) {
+		_ = a.sendResp(msg.ID, msg.Action, false, "refused: target is a symlink or unsupported file type", nil)
 		return
 	}
 	p, err := a.resolveScoped(rawPath)
@@ -1227,8 +1314,16 @@ func (a *agent) handlePullInit(msg proto.Message) {
 		_ = a.sendResp(msg.ID, msg.Action, false, err.Error(), nil)
 		return
 	}
-	if lfi.Mode()&os.ModeSymlink != 0 || !lfi.Mode().IsRegular() {
-		_ = a.sendResp(msg.ID, msg.Action, false, "refused: target is a symlink or non-regular file", nil)
+	if lfi.Mode()&os.ModeSymlink != 0 {
+		_ = a.sendResp(msg.ID, msg.Action, false, "refused: target is a symlink", nil)
+		return
+	}
+	if lfi.IsDir() {
+		a.handlePullDirInit(msg, p)
+		return
+	}
+	if !lfi.Mode().IsRegular() {
+		_ = a.sendResp(msg.ID, msg.Action, false, "refused: target is not a regular file or directory", nil)
 		return
 	}
 	if lfi.Size() > maxPullFileBytes {
@@ -1267,6 +1362,9 @@ func (a *agent) handlePullInit(msg proto.Message) {
 	a.pullMu.Lock()
 	if a.curPull != nil {
 		_ = a.curPull.file.Close()
+		if a.curPull.removeOnClose && a.curPull.tmpPath != "" {
+			_ = os.Remove(a.curPull.tmpPath)
+		}
 	}
 	a.curPull = &activePull{
 		id:     pullID,
@@ -1304,6 +1402,9 @@ func (a *agent) handlePullChunk(msg proto.Message) {
 	}
 	if req.Offset != ap.offset {
 		_ = ap.file.Close()
+		if ap.removeOnClose && ap.tmpPath != "" {
+			_ = os.Remove(ap.tmpPath)
+		}
 		a.curPull = nil
 		_ = a.sendResp(msg.ID, msg.Action, false, fmt.Sprintf("pull offset mismatch: expected %d got %d", ap.offset, req.Offset), nil)
 		return
@@ -1316,6 +1417,9 @@ func (a *agent) handlePullChunk(msg proto.Message) {
 	remainingCap := maxPullFileBytes - ap.offset
 	if remainingCap <= 0 {
 		_ = ap.file.Close()
+		if ap.removeOnClose && ap.tmpPath != "" {
+			_ = os.Remove(ap.tmpPath)
+		}
 		a.curPull = nil
 		_ = a.sendResp(msg.ID, msg.Action, false, "pull exceeded max file size limit", nil)
 		return
@@ -1332,6 +1436,9 @@ func (a *agent) handlePullChunk(msg proto.Message) {
 	}
 	if rerr != nil && !errors.Is(rerr, io.EOF) {
 		_ = ap.file.Close()
+		if ap.removeOnClose && ap.tmpPath != "" {
+			_ = os.Remove(ap.tmpPath)
+		}
 		a.curPull = nil
 		_ = a.sendResp(msg.ID, msg.Action, false, rerr.Error(), nil)
 		return
@@ -1348,6 +1455,10 @@ func (a *agent) handlePullChunk(msg proto.Message) {
 	if isEOF {
 		resp.SHA256 = hex.EncodeToString(ap.hasher.Sum(nil))
 		_ = ap.file.Close()
+		if ap.removeOnClose && ap.tmpPath != "" {
+			_ = os.Remove(ap.tmpPath)
+		}
+		fmt.Fprintf(os.Stderr, "%s✓ 回传完成:%s %s (%s)\n", ansiGreen, ansiReset, sanitizeSingleLine(ap.path), formatBytesHuman(ap.offset))
 		a.curPull = nil
 	}
 	_ = a.sendResp(msg.ID, msg.Action, true, "", resp)

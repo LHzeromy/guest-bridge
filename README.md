@@ -13,10 +13,11 @@
 - **Zero Third-Party Dependencies**: Written 100% with the Go standard library (`go.mod` has zero external dependencies) — concise and auditable.
 - **Mandatory Local Permission Menu Before Connecting**: Once started on an interactive console, `guest-agent` prompts the machine owner *before* dialing the relay:
   - `[1]` **Strict Read-Only** — inspect files/directories/system info only; all writes and generic commands are disabled.
-  - `[2]` **Interactive Read + Confirm Writes** — allowlisted system read-only queries run with live terminal logs; sensitive paths (`~/.ssh`, `.env`, `*.key`, etc.), all file edits (with colored unified diff preview), mutating/compound commands, and screenshots pause for `[y/N]` approval.
-  - `[3]` **Directory-Scoped Mode** — locks file operations strictly inside the starting working directory (with canonical path & symlink checks), disables generic shell `exec`, and requires `[y/N]` for writes.
+  - `[2]` **Interactive Read + Confirm Writes** — allowlisted system read-only queries run with live terminal logs; sensitive paths (`~/.ssh`, `.env`, `*.key`, etc.), all file edits (with colored unified diff preview), mutating/compound commands (with live sanitized stdout/stderr echo + exit status on the target terminal), chunked E2EE push/pull transfers, and screenshots pause for `[y/N]` approval.
+  - `[3]` **Directory-Scoped Mode** — locks file operations strictly inside the starting working directory (with canonical path & symlink checks), disables generic shell `exec`, and requires `[y/N]` for writes/pushes/pulls.
   - `[q]` **Cancel** — exits immediately without opening any network connection.
-- **On-Screen Exit Summary**: Exiting (`Ctrl+C` or `guestctl close`) disconnects the tunnel, attempts best-effort temp-file cleanup, and prints an in-memory operation summary (files read, query count, approved edits/commands/screenshots, and rejected requests) without writing log files to the target.
+- **Live Execution Echo & Batch File Transfer (`v0.2.0`)**: Approved `exec` commands stream sanitized stdout/stderr in real time on the target terminal (capped to avoid screen flooding) followed by exit code & duration. `guestctl push` sends large/binary files, multiple files, or entire directories (up to 200 MiB) behind a **single `[y/N]` manifest confirmation** with SHA-256 verification and strict symlink/traversal protection; `guestctl pull` also supports single-confirmation directory `.tar.gz` collection.
+- **On-Screen Exit Summary**: Exiting (`Ctrl+C` or `guestctl close`) disconnects the tunnel, attempts best-effort temp-file cleanup, and prints an in-memory operation summary (files read, query count, approved edits/commands/pulls/pushes/screenshots, and rejected requests) without writing log files to the target.
 - **End-to-End Encrypted Blind Relay**: TLS 1.3 cert-pinned tunnel + mutual HMAC handshake + AES-256-GCM sequence-numbered framing. The relay never receives the 256-bit E2EE PSK and writes zero session logs to disk.
 - **Local Archival Only on Controller Host**: Metadata (`meta.json`), session audit logs (`session.jsonl`), pre-edit backups/diffs (`diffs/`), and screenshots (`screenshots/`) are saved solely on the controller machine under `~/.local/share/guestctl/sessions/`. *(Note: upon connection, the guest shares its username, hostname, OS, and working directory with the controller.)*
 
@@ -93,7 +94,7 @@ cat > ~/.config/guestctl/config.json << 'EOF'
   "relay_addr": "YOUR_RELAY_IP_OR_DOMAIN:34434",
   "admin_sock": "/run/guest-relay/admin.sock",
   "admin_user": "guest-relay",
-  "release_url": "https://github.com/LHzeromy/guest-bridge/releases/download/v0.1.2"
+  "release_url": "https://github.com/LHzeromy/guest-bridge/releases/download/v0.2.0"
 }
 EOF
 chmod 600 ~/.config/guestctl/config.json
@@ -118,7 +119,9 @@ guestctl read --start 1 --end 120 /path/to/file
 guestctl grep "ERROR" /path/to/logs
 guestctl exec "nvidia-smi"
 guestctl edit --old "batch_size = 64" --new "batch_size = 16" /path/to/train.py
-guestctl pull --out ./collected/ /path/to/deploy_metrics.npz   # chunked E2EE pull (up to 100 MiB, [y/N] gated)
+guestctl push ./policy/ /path/on/remote/policy/                # batch/binary E2EE push (up to 200 MiB, 1x [y/N])
+guestctl pull --out ./collected/ /path/to/deploy_metrics.npz   # chunked E2EE pull of file or dir (up to 200 MiB, [y/N])
+guestctl pull --out ./logs_dir --extract /path/to/remote_logs  # pull whole directory as .tar.gz and safely extract
 guestctl screenshot
 
 # 4. End session cleanly (or target owner presses Ctrl+C anytime)

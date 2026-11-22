@@ -506,6 +506,9 @@ func (d *bridgeDaemon) handleLocalHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/pull":
 		d.handleLocalPull(w, r)
 		return
+	case "/push":
+		d.handleLocalPush(w, r)
+		return
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -642,6 +645,9 @@ func (d *bridgeDaemon) handleLocalPull(w http.ResponseWriter, r *http.Request) {
 
 	idx := d.pullSeq.Add(1)
 	safeName := sanitizeArchiveName(pr.Path)
+	if pr.IsArchive && !strings.HasSuffix(safeName, ".tar.gz") {
+		safeName += ".tar.gz"
+	}
 	finalPath := filepath.Join(pulledDir, fmt.Sprintf("%03d_%s", idx, safeName))
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
@@ -655,6 +661,8 @@ func (d *bridgeDaemon) handleLocalPull(w http.ResponseWriter, r *http.Request) {
 		"saved_path":  finalPath,
 		"bytes":       offset,
 		"sha256":      localSHA,
+		"is_archive":  pr.IsArchive,
+		"file_count":  pr.FileCount,
 		"approved":    true,
 	})
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -664,6 +672,8 @@ func (d *bridgeDaemon) handleLocalPull(w http.ResponseWriter, r *http.Request) {
 		"saved_path":  finalPath,
 		"bytes":       offset,
 		"sha256":      localSHA,
+		"is_archive":  pr.IsArchive,
+		"file_count":  pr.FileCount,
 	})
 }
 
@@ -1287,10 +1297,11 @@ func cmdWrite(args []string) {
 func cmdPull(args []string) {
 	args = reorderFlags(args, map[string]bool{"out": true})
 	fs := flag.NewFlagSet("pull", flag.ExitOnError)
-	outPath := fs.String("out", "", "optional local destination file or directory to copy the pulled file into")
+	outPath := fs.String("out", "", "optional local destination file or directory to copy/extract the pulled data into")
+	extract := fs.Bool("extract", false, "if pulling a remote directory archive (.tar.gz), automatically extract into --out directory")
 	_ = fs.Parse(args)
 	if fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: guestctl pull [--out LOCAL_PATH_OR_DIR] <remote_path>")
+		fmt.Fprintln(os.Stderr, "usage: guestctl pull [--out LOCAL_PATH_OR_DIR] [--extract] <remote_file_or_dir>")
 		os.Exit(2)
 	}
 	remotePath := fs.Arg(0)
@@ -1313,6 +1324,8 @@ func cmdPull(args []string) {
 		SavedPath  string `json:"saved_path"`
 		Bytes      int64  `json:"bytes"`
 		SHA256     string `json:"sha256"`
+		IsArchive  bool   `json:"is_archive"`
+		FileCount  int    `json:"file_count"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		fmt.Fprintln(os.Stderr, "解析响应失败:", err)
@@ -1328,13 +1341,31 @@ func cmdPull(args []string) {
 	}
 
 	copiedTo := ""
-	if *outPath != "" {
+	extractedDir := ""
+	extractedCount := 0
+	if *extract && r.IsArchive {
+		destDir := *outPath
+		if destDir == "" {
+			destDir = strings.TrimSuffix(r.SavedPath, ".tar.gz")
+		}
+		cnt, err := safeExtractLocalTarGz(r.SavedPath, destDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "归档已保存至 %s，但安全解压到 %s 失败: %v\n", r.SavedPath, destDir, err)
+			os.Exit(1)
+		}
+		extractedDir = destDir
+		extractedCount = cnt
+	} else if *outPath != "" {
 		dest := *outPath
+		archName := sanitizeArchiveName(r.RemotePath)
+		if r.IsArchive && !strings.HasSuffix(archName, ".tar.gz") {
+			archName += ".tar.gz"
+		}
 		if fi, err := os.Stat(dest); err == nil && fi.IsDir() {
-			dest = filepath.Join(dest, sanitizeArchiveName(r.RemotePath))
+			dest = filepath.Join(dest, archName)
 		} else if strings.HasSuffix(dest, "/") || strings.HasSuffix(dest, string(os.PathSeparator)) {
 			_ = os.MkdirAll(dest, 0755)
-			dest = filepath.Join(dest, sanitizeArchiveName(r.RemotePath))
+			dest = filepath.Join(dest, archName)
 		} else {
 			_ = os.MkdirAll(filepath.Dir(dest), 0755)
 		}
@@ -1345,9 +1376,16 @@ func cmdPull(args []string) {
 		copiedTo = dest
 	}
 
-	fmt.Printf("✓ 已端到端加密回传并校验 SHA-256 一致 (%d bytes)\n", r.Bytes)
+	if r.IsArchive {
+		fmt.Printf("✓ 已打包端到端加密回传目录并校验 SHA-256 一致（%d 个文件，压缩后 %d bytes）\n", r.FileCount, r.Bytes)
+	} else {
+		fmt.Printf("✓ 已端到端加密回传并校验 SHA-256 一致 (%d bytes)\n", r.Bytes)
+	}
 	fmt.Printf("  远端路径: %s\n", r.RemotePath)
 	fmt.Printf("  归档路径: %s\n", r.SavedPath)
+	if extractedDir != "" {
+		fmt.Printf("  解压目录: %s (%d 个文件)\n", extractedDir, extractedCount)
+	}
 	if copiedTo != "" {
 		fmt.Printf("  导出路径: %s\n", copiedTo)
 	}
@@ -1411,8 +1449,9 @@ func usage() {
   guestctl grep [--max N] <pattern> [path] 只读正则搜索目标机文本（自动跳过密钥目录）
   guestctl exec [--cwd D] <cmd...>         执行命令（可信系统只读查询自动跑；修改/复合命令弹 [y/N]）
   guestctl edit --old A --new B <path>     目标机展示彩色 Diff 并弹 [y/N] 后原子修改文件
-  guestctl write --from-file F <path>      目标机展示 Diff 并弹 [y/N] 后原子写入文件
-  guestctl pull [--out DEST] <remote_path> 目标机 [y/N] 同意后分块加密回传文件至主控机（最高 100MB）
+  guestctl write --from-file F <path>      目标机展示 Diff 并弹 [y/N] 后原子写入单文本文件
+  guestctl push [--exclude P] <src...> <dst>  单次 [y/N] 确认后端到端加密推送大文件/多文件/整目录（最高 200MB）
+  guestctl pull [--out D] [--extract] <path>  目标机 [y/N] 同意后加密回传单文件或整目录（最高 200MB）
   guestctl screenshot                      目标机 [y/N] 同意后截屏并仅保存到主控机本地
   guestctl close                           主动结束联调会话并通知目标机退出清理
   guestctl sessions                        列出保存在主控机本地的所有历史排查归档`)
@@ -1448,6 +1487,8 @@ func main() {
 		cmdWrite(rest)
 	case "pull":
 		cmdPull(rest)
+	case "push":
+		cmdPush(rest)
 	case "screenshot":
 		cmdScreenshot()
 	case "close":
