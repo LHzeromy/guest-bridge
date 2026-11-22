@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -220,6 +221,7 @@ type bridgeDaemon struct {
 	reqSeq      atomic.Int64
 	diffSeq     atomic.Int64
 	shotSeq     atomic.Int64
+	pullSeq     atomic.Int64
 	shutdownCh  chan struct{}
 	shutOnce    sync.Once
 }
@@ -501,9 +503,168 @@ func (d *bridgeDaemon) handleLocalHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 		return
+	case "/pull":
+		d.handleLocalPull(w, r)
+		return
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+func sanitizeArchiveName(p string) string {
+	base := filepath.Base(strings.ReplaceAll(p, "\\", "/"))
+	if base == "" || base == "." || base == ".." || base == "/" {
+		return "file.bin"
+	}
+	var b strings.Builder
+	for _, r := range base {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" || out == "." || out == ".." {
+		return "file.bin"
+	}
+	return out
+}
+
+func (d *bridgeDaemon) handleLocalPull(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	var req struct {
+		RemotePath string `json:"remote_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.RemotePath) == "" {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "remote_path is required"})
+		return
+	}
+
+	initMsg, err := d.sendRPC("pull_init", proto.PullInitReq{Path: req.RemotePath}, 5*time.Minute)
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if !initMsg.OK {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": initMsg.Error})
+		return
+	}
+	var pr proto.PullInitResp
+	if err := json.Unmarshal(initMsg.Payload, &pr); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid pull_init response"})
+		return
+	}
+	if !pr.Approved {
+		d.writeAudit(map[string]any{"action": "pull_file", "remote_path": pr.Path, "approved": false})
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "approved": false, "remote_path": pr.Path})
+		return
+	}
+
+	pulledDir := filepath.Join(d.sessionDir, "pulled")
+	if err := os.MkdirAll(pulledDir, 0700); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	tmpF, err := os.CreateTemp(pulledDir, ".pull-tmp-*")
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	tmpPath := tmpF.Name()
+	cleanup := true
+	defer func() {
+		_ = tmpF.Close()
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	hasher := sha256.New()
+	var offset int64
+	var remoteSHA string
+	const chunkSize = 256 * 1024
+
+	for {
+		chMsg, err := d.sendRPC("pull_chunk", proto.PullChunkReq{
+			PullID: pr.PullID, Offset: offset, Size: chunkSize,
+		}, 60*time.Second)
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		if !chMsg.OK {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": chMsg.Error})
+			return
+		}
+		var cr proto.PullChunkResp
+		if err := json.Unmarshal(chMsg.Payload, &cr); err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid pull_chunk response"})
+			return
+		}
+		if cr.BytesRead > 0 {
+			raw, err := base64.StdEncoding.DecodeString(cr.DataBase64)
+			if err != nil || len(raw) != cr.BytesRead {
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "corrupted chunk encoding"})
+				return
+			}
+			if _, err := tmpF.Write(raw); err != nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			_, _ = hasher.Write(raw)
+			offset += int64(len(raw))
+		}
+		if cr.EOF {
+			remoteSHA = cr.SHA256
+			break
+		}
+	}
+
+	localSHA := hex.EncodeToString(hasher.Sum(nil))
+	if remoteSHA == "" || localSHA != remoteSHA {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": fmt.Sprintf("sha256 mismatch: local=%s remote=%s", localSHA, remoteSHA)})
+		return
+	}
+	if err := tmpF.Sync(); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if err := tmpF.Chmod(0600); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if err := tmpF.Close(); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	idx := d.pullSeq.Add(1)
+	safeName := sanitizeArchiveName(pr.Path)
+	finalPath := filepath.Join(pulledDir, fmt.Sprintf("%03d_%s", idx, safeName))
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	cleanup = false
+
+	d.writeAudit(map[string]any{
+		"action":      "pull_file",
+		"remote_path": pr.Path,
+		"saved_path":  finalPath,
+		"bytes":       offset,
+		"sha256":      localSHA,
+		"approved":    true,
+	})
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":          true,
+		"approved":    true,
+		"remote_path": pr.Path,
+		"saved_path":  finalPath,
+		"bytes":       offset,
+		"sha256":      localSHA,
+	})
 }
 
 func (d *bridgeDaemon) archiveRPC(action string, reqPayload json.RawMessage, resp *proto.Message) {
@@ -1123,6 +1284,93 @@ func cmdWrite(args []string) {
 	fmt.Printf("✓ 已写入 %s (%d bytes, created=%v; backup archived locally)\n", r.Path, r.BytesWritten, r.Created)
 }
 
+func cmdPull(args []string) {
+	args = reorderFlags(args, map[string]bool{"out": true})
+	fs := flag.NewFlagSet("pull", flag.ExitOnError)
+	outPath := fs.String("out", "", "optional local destination file or directory to copy the pulled file into")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: guestctl pull [--out LOCAL_PATH_OR_DIR] <remote_path>")
+		os.Exit(2)
+	}
+	remotePath := fs.Arg(0)
+
+	body, _ := json.Marshal(map[string]string{"remote_path": remotePath})
+	client := localClient()
+	client.Timeout = 25 * time.Minute
+	resp, err := client.Post("http://unix/pull", "application/json", bytes.NewReader(body))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误: 未检测到活跃联调会话或传输中断: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var r struct {
+		OK         bool   `json:"ok"`
+		Approved   bool   `json:"approved"`
+		Error      string `json:"error"`
+		RemotePath string `json:"remote_path"`
+		SavedPath  string `json:"saved_path"`
+		Bytes      int64  `json:"bytes"`
+		SHA256     string `json:"sha256"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		fmt.Fprintln(os.Stderr, "解析响应失败:", err)
+		os.Exit(1)
+	}
+	if !r.OK {
+		fmt.Fprintln(os.Stderr, "回传失败:", r.Error)
+		os.Exit(1)
+	}
+	if !r.Approved {
+		fmt.Fprintln(os.Stderr, "[目标机操作者拒绝了该文件回传]")
+		os.Exit(1)
+	}
+
+	copiedTo := ""
+	if *outPath != "" {
+		dest := *outPath
+		if fi, err := os.Stat(dest); err == nil && fi.IsDir() {
+			dest = filepath.Join(dest, sanitizeArchiveName(r.RemotePath))
+		} else if strings.HasSuffix(dest, "/") || strings.HasSuffix(dest, string(os.PathSeparator)) {
+			_ = os.MkdirAll(dest, 0755)
+			dest = filepath.Join(dest, sanitizeArchiveName(r.RemotePath))
+		} else {
+			_ = os.MkdirAll(filepath.Dir(dest), 0755)
+		}
+		if err := copyLocalFile(r.SavedPath, dest); err != nil {
+			fmt.Fprintf(os.Stderr, "文件已归档至 %s，但复制到 %s 失败: %v\n", r.SavedPath, dest, err)
+			os.Exit(1)
+		}
+		copiedTo = dest
+	}
+
+	fmt.Printf("✓ 已端到端加密回传并校验 SHA-256 一致 (%d bytes)\n", r.Bytes)
+	fmt.Printf("  远端路径: %s\n", r.RemotePath)
+	fmt.Printf("  归档路径: %s\n", r.SavedPath)
+	if copiedTo != "" {
+		fmt.Printf("  导出路径: %s\n", copiedTo)
+	}
+	fmt.Printf("  SHA-256:  %s\n", r.SHA256)
+}
+
+func copyLocalFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
 func cmdScreenshot() {
 	msg, err := callLocalRPC("screenshot", nil, 300)
 	mustOK(msg, err)
@@ -1164,6 +1412,7 @@ func usage() {
   guestctl exec [--cwd D] <cmd...>         执行命令（可信系统只读查询自动跑；修改/复合命令弹 [y/N]）
   guestctl edit --old A --new B <path>     目标机展示彩色 Diff 并弹 [y/N] 后原子修改文件
   guestctl write --from-file F <path>      目标机展示 Diff 并弹 [y/N] 后原子写入文件
+  guestctl pull [--out DEST] <remote_path> 目标机 [y/N] 同意后分块加密回传文件至主控机（最高 100MB）
   guestctl screenshot                      目标机 [y/N] 同意后截屏并仅保存到主控机本地
   guestctl close                           主动结束联调会话并通知目标机退出清理
   guestctl sessions                        列出保存在主控机本地的所有历史排查归档`)
@@ -1197,6 +1446,8 @@ func main() {
 		cmdEdit(rest)
 	case "write":
 		cmdWrite(rest)
+	case "pull":
+		cmdPull(rest)
 	case "screenshot":
 		cmdScreenshot()
 	case "close":

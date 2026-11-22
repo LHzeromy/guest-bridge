@@ -131,3 +131,27 @@ type ScreenshotResp struct {
 	Tool      string `json:"tool"`
 	Approved  bool   `json:"approved"`
 }
+
+type PullInitReq struct {
+	Path string `json:"path"`
+}
+
+type PullInitResp struct {
+	PullID   string `json:"pull_id,omitempty"`
+	Path     string `json:"path"`
+	Size     int64  `json:"size"`
+	Approved bool   `json:"approved"`
+}
+
+type PullChunkReq struct {
+	PullID string `json:"pull_id"`
+	Offset int64  `json:"offset"`
+	Size   int    `json:"size"`
+}
+
+type PullChunkResp struct {
+	DataBase64 string `json:"data_base64,omitempty"`
+	BytesRead  int    `json:"bytes_read"`
+	EOF        bool   `json:"eof"`
+	SHA256     string `json:"sha256,omitempty"`
+}

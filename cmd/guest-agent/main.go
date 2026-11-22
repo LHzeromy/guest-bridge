@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"net"
@@ -43,7 +45,9 @@ const (
 	ansiCyan   = "\033[36m"
 	ansiDim    = "\033[2m"
 
-	maxEditFileBytes = 2 * 1024 * 1024 // 2 MiB max target file size for edit/write preview
+	maxEditFileBytes = 2 * 1024 * 1024   // 2 MiB max target file size for edit/write preview
+	maxPullFileBytes = 100 * 1024 * 1024 // 100 MiB max file size for chunked pull transfer
+	maxPullChunkSize = 256 * 1024        // 256 KiB raw chunk per E2EE frame
 )
 
 // Populated automatically by CI/Release builds via -ldflags.
@@ -59,6 +63,7 @@ type sessionStats struct {
 	readSeen      map[string]bool
 	roQueries     int
 	approvedEdits []string
+	approvedPulls []string
 	approvedExecs int
 	screenshots   int
 	rejectedOps   int
@@ -89,6 +94,12 @@ func (s *sessionStats) addROQuery() {
 func (s *sessionStats) addEdit(p string) {
 	s.mu.Lock()
 	s.approvedEdits = append(s.approvedEdits, p)
+	s.mu.Unlock()
+}
+
+func (s *sessionStats) addPull(p string) {
+	s.mu.Lock()
+	s.approvedPulls = append(s.approvedPulls, p)
 	s.mu.Unlock()
 }
 
@@ -145,6 +156,15 @@ func (s *sessionStats) printReceipt(w io.Writer, cleaned bool) {
 		fmt.Fprintf(w, "（%s）", strings.Join(safeEdits, ", "))
 	}
 	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  批准回传: %d 个", len(s.approvedPulls))
+	if len(s.approvedPulls) > 0 {
+		var safePulls []string
+		for _, pf := range s.approvedPulls {
+			safePulls = append(safePulls, sanitizeSingleLine(pf))
+		}
+		fmt.Fprintf(w, "（%s）", strings.Join(safePulls, ", "))
+	}
+	fmt.Fprintln(w)
 	fmt.Fprintf(w, "  批准截屏: %d 次\n", s.screenshots)
 	fmt.Fprintf(w, "  已拒操作: %d 次\n", s.rejectedOps)
 	if cleaned {
@@ -155,11 +175,22 @@ func (s *sessionStats) printReceipt(w io.Writer, cleaned bool) {
 	fmt.Fprintf(w, "%s======================================================================%s\n", ansiCyan+ansiBold, ansiReset)
 }
 
+type activePull struct {
+	id     string
+	path   string
+	file   *os.File
+	size   int64
+	offset int64
+	hasher hash.Hash
+}
+
 type agent struct {
 	mode       string // "confirm" or "ro" (strictly chosen by local operator)
 	rootScope  string // optional resolved directory boundary (set when operator picks [3])
 	conn       *e2ee.Conn
 	promptMu   sync.Mutex
+	pullMu     sync.Mutex
+	curPull    *activePull
 	ttyLines   <-chan string
 	ttyOutFile *os.File
 	hasTTY     bool
@@ -187,7 +218,17 @@ func newAgent(mode, rootScope string, conn *e2ee.Conn, outF *os.File, ttyLines <
 func (a *agent) stop() {
 	a.stopOnce.Do(func() {
 		a.cancel()
+		a.closeActivePull()
 	})
+}
+
+func (a *agent) closeActivePull() {
+	a.pullMu.Lock()
+	defer a.pullMu.Unlock()
+	if a.curPull != nil {
+		_ = a.curPull.file.Close()
+		a.curPull = nil
+	}
 }
 
 func (a *agent) isStopped() bool {
@@ -425,6 +466,10 @@ func (a *agent) serveLoop() error {
 			a.handleWriteFile(msg)
 		case "screenshot":
 			a.handleScreenshot(msg)
+		case "pull_init":
+			a.handlePullInit(msg)
+		case "pull_chunk":
+			a.handlePullChunk(msg)
 		default:
 			_ = a.sendResp(msg.ID, msg.Action, false, "unknown action: "+msg.Action, nil)
 		}
@@ -1142,6 +1187,170 @@ func (a *agent) handleScreenshot(msg proto.Message) {
 		Tool:      usedTool,
 		Approved:  true,
 	})
+}
+
+func formatBytesHuman(n int64) string {
+	switch {
+	case n >= 1024*1024:
+		return fmt.Sprintf("%.2f MB (%d 字节)", float64(n)/(1024*1024), n)
+	case n >= 1024:
+		return fmt.Sprintf("%.1f KB (%d 字节)", float64(n)/1024, n)
+	default:
+		return fmt.Sprintf("%d 字节", n)
+	}
+}
+
+func (a *agent) handlePullInit(msg proto.Message) {
+	var req proto.PullInitReq
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		_ = a.sendResp(msg.ID, msg.Action, false, "bad payload: "+err.Error(), nil)
+		return
+	}
+	rawPath := expandPath(req.Path)
+	if a.mode == "ro" {
+		a.stats.addReject()
+		_ = a.sendResp(msg.ID, msg.Action, true, "", proto.PullInitResp{Path: rawPath, Approved: false})
+		return
+	}
+	if lfi0, err := os.Lstat(rawPath); err == nil && (lfi0.Mode()&os.ModeSymlink != 0 || !lfi0.Mode().IsRegular()) {
+		_ = a.sendResp(msg.ID, msg.Action, false, "refused: target is a symlink or non-regular file", nil)
+		return
+	}
+	p, err := a.resolveScoped(rawPath)
+	if err != nil {
+		a.stats.addReject()
+		_ = a.sendResp(msg.ID, msg.Action, false, err.Error(), nil)
+		return
+	}
+	lfi, err := os.Lstat(p)
+	if err != nil {
+		_ = a.sendResp(msg.ID, msg.Action, false, err.Error(), nil)
+		return
+	}
+	if lfi.Mode()&os.ModeSymlink != 0 || !lfi.Mode().IsRegular() {
+		_ = a.sendResp(msg.ID, msg.Action, false, "refused: target is a symlink or non-regular file", nil)
+		return
+	}
+	if lfi.Size() > maxPullFileBytes {
+		_ = a.sendResp(msg.ID, msg.Action, false, fmt.Sprintf("refused: file size (%d bytes) exceeds %d MB limit", lfi.Size(), maxPullFileBytes/(1024*1024)), nil)
+		return
+	}
+
+	body := fmt.Sprintf("  文件路径: %s\n  文件大小: %s\n  说明: 仅端到端加密回传至主控机，不会修改或删除本机原文件", sanitizeSingleLine(p), formatBytesHuman(lfi.Size()))
+	if !a.askConfirm("📦 请求回传文件至主控机", body, "是否允许回传该文件?") {
+		_ = a.sendResp(msg.ID, msg.Action, true, "", proto.PullInitResp{Path: p, Size: lfi.Size(), Approved: false})
+		return
+	}
+
+	// Open approved regular file handle immediately (binds exact inode for all subsequent chunks).
+	curLfi, err := os.Lstat(p)
+	if err != nil || curLfi.Mode()&os.ModeSymlink != 0 || !curLfi.Mode().IsRegular() {
+		_ = a.sendResp(msg.ID, msg.Action, false, "aborted: target file changed type during confirmation", nil)
+		return
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		_ = a.sendResp(msg.ID, msg.Action, false, err.Error(), nil)
+		return
+	}
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxPullFileBytes {
+		_ = f.Close()
+		_ = a.sendResp(msg.ID, msg.Action, false, "aborted: file size/type invalid after open", nil)
+		return
+	}
+
+	var idBytes [12]byte
+	_, _ = io.ReadFull(rand.Reader, idBytes[:])
+	pullID := hex.EncodeToString(idBytes[:])
+
+	a.pullMu.Lock()
+	if a.curPull != nil {
+		_ = a.curPull.file.Close()
+	}
+	a.curPull = &activePull{
+		id:     pullID,
+		path:   p,
+		file:   f,
+		size:   fi.Size(),
+		offset: 0,
+		hasher: sha256.New(),
+	}
+	a.pullMu.Unlock()
+
+	a.stats.addPull(p)
+	_ = a.sendResp(msg.ID, msg.Action, true, "", proto.PullInitResp{
+		PullID:   pullID,
+		Path:     p,
+		Size:     fi.Size(),
+		Approved: true,
+	})
+}
+
+func (a *agent) handlePullChunk(msg proto.Message) {
+	var req proto.PullChunkReq
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		_ = a.sendResp(msg.ID, msg.Action, false, "bad payload: "+err.Error(), nil)
+		return
+	}
+
+	a.pullMu.Lock()
+	defer a.pullMu.Unlock()
+
+	ap := a.curPull
+	if ap == nil || ap.id != req.PullID {
+		_ = a.sendResp(msg.ID, msg.Action, false, "no active pull session matching pull_id", nil)
+		return
+	}
+	if req.Offset != ap.offset {
+		_ = ap.file.Close()
+		a.curPull = nil
+		_ = a.sendResp(msg.ID, msg.Action, false, fmt.Sprintf("pull offset mismatch: expected %d got %d", ap.offset, req.Offset), nil)
+		return
+	}
+	chunkSize := req.Size
+	if chunkSize <= 0 || chunkSize > maxPullChunkSize {
+		chunkSize = maxPullChunkSize
+	}
+	// Cap total read to approved file size + guard against growing files exceeding maxPullFileBytes.
+	remainingCap := maxPullFileBytes - ap.offset
+	if remainingCap <= 0 {
+		_ = ap.file.Close()
+		a.curPull = nil
+		_ = a.sendResp(msg.ID, msg.Action, false, "pull exceeded max file size limit", nil)
+		return
+	}
+	if int64(chunkSize) > remainingCap {
+		chunkSize = int(remainingCap)
+	}
+
+	buf := make([]byte, chunkSize)
+	n, rerr := ap.file.Read(buf)
+	if n > 0 {
+		ap.offset += int64(n)
+		_, _ = ap.hasher.Write(buf[:n])
+	}
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
+		_ = ap.file.Close()
+		a.curPull = nil
+		_ = a.sendResp(msg.ID, msg.Action, false, rerr.Error(), nil)
+		return
+	}
+
+	isEOF := errors.Is(rerr, io.EOF) || (n == 0)
+	resp := proto.PullChunkResp{
+		BytesRead: n,
+		EOF:       isEOF,
+	}
+	if n > 0 {
+		resp.DataBase64 = base64.StdEncoding.EncodeToString(buf[:n])
+	}
+	if isEOF {
+		resp.SHA256 = hex.EncodeToString(ap.hasher.Sum(nil))
+		_ = ap.file.Close()
+		a.curPull = nil
+	}
+	_ = a.sendResp(msg.ID, msg.Action, true, "", resp)
 }
 
 type limitedBuffer struct {

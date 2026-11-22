@@ -111,7 +111,7 @@ cat > ~/.config/guestctl/config.json << 'EOF'
   "relay_addr": "YOUR_RELAY_IP_OR_DOMAIN:34434",
   "admin_sock": "/run/guest-relay/admin.sock",
   "admin_user": "guest-relay",
-  "release_url": "https://github.com/LHzeromy/guest-bridge/releases/download/v0.1.1"
+  "release_url": "https://github.com/LHzeromy/guest-bridge/releases/download/v0.1.2"
 }
 EOF
 chmod 600 ~/.config/guestctl/config.json
@@ -138,6 +138,7 @@ guestctl read --start 1 --end 120 /path/to/file
 guestctl grep "ERROR" /path/to/logs
 guestctl exec "nvidia-smi"
 guestctl edit --old "batch_size = 64" --new "batch_size = 16" /path/to/train.py
+guestctl pull --out ./collected/ /path/to/deploy_metrics.npz   # 目标机 [y/N] 同意后分块回传（≤100MB）
 guestctl screenshot
 
 # 4. 结束会话（目标机按 Ctrl+C 或主控端执行 close 均可随时断开）
