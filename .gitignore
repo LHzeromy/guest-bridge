@@ -1,0 +1,12 @@
+dist/
+release/
+/guestctl
+/guest-agent
+/guest-relay
+*.exe
+*.pem
+*.key
+*.log
+config.json
+.env
+.DS_Store
