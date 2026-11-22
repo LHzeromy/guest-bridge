@@ -1,5 +1,7 @@
 # guest-bridge (`guestctl`)
 
+**English** | [简体中文](./README.zh-CN.md)
+
 **Zero-dependency, pure Go stdlib, end-to-end encrypted interactive remote troubleshooting bridge.**
 
 `guest-bridge` lets a helper assist with debugging a secondary **Linux (x86_64 / ARM64)** or **Windows (x64)** machine **without installing SSH servers, without placing helper credentials on the target machine, and while keeping interactive consent in the hands of the person sitting at the target keyboard**.
@@ -90,7 +92,8 @@ cat > ~/.config/guestctl/config.json << 'EOF'
   "ssh_host": "my-relay-ssh-alias",
   "relay_addr": "YOUR_RELAY_IP_OR_DOMAIN:34434",
   "admin_sock": "/run/guest-relay/admin.sock",
-  "admin_user": "guest-relay"
+  "admin_user": "guest-relay",
+  "release_url": "https://github.com/LHzeromy/guest-bridge/releases/download/v0.1.1"
 }
 EOF
 chmod 600 ~/.config/guestctl/config.json
@@ -100,7 +103,8 @@ chmod 600 ~/.config/guestctl/config.json
 
 ```bash
 # 1. Run locally in your own terminal (keep pairing commands out of cloud chats)
-guestctl pair                 # Linux x86_64 (default)
+guestctl pair                 # Linux x86_64 (GitHub Release first, fallback to relay mirror)
+guestctl pair --from github   # Download strictly from GitHub Releases over verified HTTPS
 guestctl pair --os win        # Windows 10/11 PowerShell scriptblock
 guestctl pair --os arm64      # Linux ARM64
 
