@@ -31,13 +31,14 @@ import (
 )
 
 var (
-	reSSHHost   = regexp.MustCompile(`^[a-zA-Z0-9._@-]+$`)
-	reAdminUser = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
-	reAdminSock = regexp.MustCompile(`^/[a-zA-Z0-9._/-]+$`)
-	reRelayHost = regexp.MustCompile(`^[a-zA-Z0-9.:-]+$`)
+	reSSHHost    = regexp.MustCompile(`^[a-zA-Z0-9._@-]+$`)
+	reAdminUser  = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+	reAdminSock  = regexp.MustCompile(`^/[a-zA-Z0-9._/-]+$`)
+	reRelayHost  = regexp.MustCompile(`^[a-zA-Z0-9.:-]+$`)
+	reReleaseURL = regexp.MustCompile(`^https://[a-zA-Z0-9._~:/@-]+$`)
 )
 
-func validatePairInputs(sshHost, relayAddr, adminUser, adminSock string) error {
+func validatePairInputs(sshHost, relayAddr, adminUser, adminSock, releaseURL string) error {
 	if sshHost == "" || strings.HasPrefix(sshHost, "-") || !reSSHHost.MatchString(sshHost) {
 		return fmt.Errorf("invalid ssh_host: %q", sshHost)
 	}
@@ -51,6 +52,9 @@ func validatePairInputs(sshHost, relayAddr, adminUser, adminSock string) error {
 	if err != nil || host == "" || port == "" || !reRelayHost.MatchString(host) {
 		return fmt.Errorf("invalid relay_addr (expected host:port): %q", relayAddr)
 	}
+	if releaseURL != "" && !reReleaseURL.MatchString(releaseURL) {
+		return fmt.Errorf("invalid release_url (must be https://...): %q", releaseURL)
+	}
 	return nil
 }
 
@@ -60,10 +64,11 @@ func configPath() string {
 }
 
 type localConfig struct {
-	SSHHost   string `json:"ssh_host"`
-	RelayAddr string `json:"relay_addr"`
-	AdminSock string `json:"admin_sock"`
-	AdminUser string `json:"admin_user"`
+	SSHHost    string `json:"ssh_host"`
+	RelayAddr  string `json:"relay_addr"`
+	AdminSock  string `json:"admin_sock"`
+	AdminUser  string `json:"admin_user"`
+	ReleaseURL string `json:"release_url,omitempty"` // e.g. https://github.com/OWNER/guest-bridge/releases/download/v0.1.1
 }
 
 func loadLocalConfig() (localConfig, error) {
@@ -700,20 +705,31 @@ func cmdPair(args []string) {
 		fmt.Fprintln(os.Stderr, "配置错误:", err)
 		os.Exit(2)
 	}
-	args = reorderFlags(args, map[string]bool{"ssh-host": true, "relay": true, "mode": true, "os": true})
+	args = reorderFlags(args, map[string]bool{"ssh-host": true, "relay": true, "mode": true, "os": true, "from": true, "release-url": true})
 	fs := flag.NewFlagSet("pair", flag.ExitOnError)
 	sshHost := fs.String("ssh-host", cfg.SSHHost, "SSH host alias for relay admin socket (or ~/.config/guestctl/config.json)")
 	relayAddr := fs.String("relay", cfg.RelayAddr, "public relay TLS address host:port (or ~/.config/guestctl/config.json)")
 	mode := fs.String("mode", "confirm", "suggested default permission mode: confirm | ro")
 	targetOS := fs.String("os", "linux-amd64", "target OS/arch: linux | linux-arm64 | windows")
+	dlFrom := fs.String("from", "auto", "binary download source: auto (GitHub Release first, fallback relay) | github | relay")
+	releaseURL := fs.String("release-url", cfg.ReleaseURL, "public GitHub Release download base URL")
 	_ = fs.Parse(args)
 
+	cleanRelURL := strings.TrimRight(strings.TrimSpace(*releaseURL), "/")
 	if *sshHost == "" || *relayAddr == "" {
 		fmt.Fprintf(os.Stderr, "请先配置 %s（设置 ssh_host 和 relay_addr），或通过 --ssh-host / --relay 传入。\n", configPath())
 		os.Exit(2)
 	}
-	if err := validatePairInputs(*sshHost, *relayAddr, cfg.AdminUser, cfg.AdminSock); err != nil {
+	if err := validatePairInputs(*sshHost, *relayAddr, cfg.AdminUser, cfg.AdminSock, cleanRelURL); err != nil {
 		fmt.Fprintln(os.Stderr, "参数校验失败:", err)
+		os.Exit(2)
+	}
+	if *dlFrom != "auto" && *dlFrom != "github" && *dlFrom != "relay" {
+		fmt.Fprintf(os.Stderr, "invalid --from %q (expected auto|github|relay)\n", *dlFrom)
+		os.Exit(2)
+	}
+	if *dlFrom == "github" && cleanRelURL == "" {
+		fmt.Fprintln(os.Stderr, "--from github requires release_url in config.json or --release-url")
 		os.Exit(2)
 	}
 	if *mode != "confirm" && *mode != "ro" {
@@ -818,20 +834,47 @@ func cmdPair(args []string) {
 		os.Exit(1)
 	}
 
+	assetName := "guest-agent-" + target
+	if target == "windows-amd64" {
+		assetName += ".exe"
+	}
+	ghAssetURL := ""
+	if cleanRelURL != "" {
+		ghAssetURL = cleanRelURL + "/" + assetName
+	}
+	relayDLURL := fmt.Sprintf("https://%s/dl/%s", *relayAddr, rs.DLToken)
+
 	var oneLiner string
 	var targetHint string
 	if target == "windows-amd64" {
 		targetHint = "在目标 Windows PowerShell（Win10/Win11）中直接粘贴回车："
-		// Direct PowerShell scriptblock (& { ... }) avoids nested double-quote variable expansion bugs.
+		var dlStep string
+		switch {
+		case *dlFrom == "github":
+			dlStep = fmt.Sprintf(`curl.exe -fsSL '%s' -o $f`, ghAssetURL)
+		case *dlFrom == "auto" && ghAssetURL != "":
+			dlStep = fmt.Sprintf(`curl.exe -fsSL --connect-timeout 6 '%s' -o $f; if ($LASTEXITCODE -ne 0) { curl.exe -kfsSL '%s' -o $f }`, ghAssetURL, relayDLURL)
+		default:
+			dlStep = fmt.Sprintf(`curl.exe -kfsSL '%s' -o $f`, relayDLURL)
+		}
 		oneLiner = fmt.Sprintf(
-			`& { $f = Join-Path $env:TEMP ('guest-agent-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.exe'); try { curl.exe -kfsSL 'https://%s/dl/%s' -o $f; if ((Get-FileHash $f -Algorithm SHA256).Hash.ToLower() -ne '%s') { throw 'SHA256 mismatch' }; $env:GB_TOKEN='%s'; $env:GB_KEY='%s'; & $f -relay '%s' -pin '%s' -mode '%s' } finally { Remove-Item -Force -ErrorAction SilentlyContinue $f } }`,
-			*relayAddr, rs.DLToken, pinnedAgentHash, rs.GuestToken, keyHex, *relayAddr, rs.CertSHA256, *mode,
+			`& { $f = Join-Path $env:TEMP ('guest-agent-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.exe'); try { %s; if ((Get-FileHash $f -Algorithm SHA256).Hash.ToLower() -ne '%s') { throw 'SHA256 mismatch' }; $env:GB_TOKEN='%s'; $env:GB_KEY='%s'; & $f -relay '%s' -pin '%s' -mode '%s' } finally { Remove-Item -Force -ErrorAction SilentlyContinue $f } }`,
+			dlStep, pinnedAgentHash, rs.GuestToken, keyHex, *relayAddr, rs.CertSHA256, *mode,
 		)
 	} else {
 		targetHint = fmt.Sprintf("在目标 %s 终端直接粘贴回车：", target)
+		var dlStep string
+		switch {
+		case *dlFrom == "github":
+			dlStep = fmt.Sprintf(`curl -fsSL %s -o "$f"`, ghAssetURL)
+		case *dlFrom == "auto" && ghAssetURL != "":
+			dlStep = fmt.Sprintf(`(curl -fsSL --connect-timeout 6 %s -o "$f" || curl -kfsSL %s -o "$f")`, ghAssetURL, relayDLURL)
+		default:
+			dlStep = fmt.Sprintf(`curl -kfsSL %s -o "$f"`, relayDLURL)
+		}
 		oneLiner = fmt.Sprintf(
-			`bash -c 'f=$(mktemp /tmp/guest-agent-XXXXXX); trap "rm -f \"$f\"" EXIT INT TERM; curl -kfsSL https://%s/dl/%s -o "$f" && echo "%s  $f" | sha256sum -c - >/dev/null && chmod 700 "$f" && GB_TOKEN=%s GB_KEY=%s "$f" -relay %s -pin %s -mode %s'`,
-			*relayAddr, rs.DLToken, pinnedAgentHash, rs.GuestToken, keyHex, *relayAddr, rs.CertSHA256, *mode,
+			`bash -c 'f=$(mktemp /tmp/guest-agent-XXXXXX); trap "rm -f \"$f\"" EXIT INT TERM; %s && echo "%s  $f" | sha256sum -c - >/dev/null && chmod 700 "$f" && GB_TOKEN=%s GB_KEY=%s "$f" -relay %s -pin %s -mode %s'`,
+			dlStep, pinnedAgentHash, rs.GuestToken, keyHex, *relayAddr, rs.CertSHA256, *mode,
 		)
 	}
 

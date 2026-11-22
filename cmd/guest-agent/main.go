@@ -46,6 +46,12 @@ const (
 	maxEditFileBytes = 2 * 1024 * 1024 // 2 MiB max target file size for edit/write preview
 )
 
+// Populated automatically by CI/Release builds via -ldflags.
+var (
+	version = "dev"
+	repoURL = ""
+)
+
 type sessionStats struct {
 	mu            sync.Mutex
 	startedAt     time.Time
@@ -1218,7 +1224,10 @@ func promptConsentMenu(outF *os.File, ttyLines <-chan string, defaultMode string
 	}
 
 	fmt.Fprintf(outF, "\n%s============================================================%s\n", ansiCyan+ansiBold, ansiReset)
-	fmt.Fprintf(outF, "%s  临时远程协助准备就绪（尚未建立网络连接，未放行任何访问）%s\n", ansiBold, ansiReset)
+	fmt.Fprintf(outF, "%s  guest-bridge (%s) 临时远程协助（尚未联网，未放行任何访问）%s\n", ansiBold, sanitizeSingleLine(version), ansiReset)
+	if repoURL != "" {
+		fmt.Fprintf(outF, "  · 开源源码: %s%s%s\n", ansiCyan, sanitizeSingleLine(repoURL), ansiReset)
+	}
 	fmt.Fprintf(outF, "  · 免管理员权限 · 每条操作实时可见 · 随时按 %sCtrl+C%s 断开退出\n", ansiBold, ansiReset)
 	fmt.Fprintf(outF, "  · 注意：连接后会将本机用户名、主机名与当前目录告知协助端用于排查\n")
 	fmt.Fprintf(outF, "%s============================================================%s\n", ansiCyan+ansiBold, ansiReset)
